@@ -28,6 +28,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
+import { createPaymentTransaction, networkPassphrase } from '@/lib/wallet/stellar-service';
 import { useWalletStore } from '@/lib/wallet/wallet-store';
 import type {
   WithdrawAssetCode,
@@ -111,7 +112,7 @@ function WithdrawFlowInner({
             <div>
               <CardTitle>Withdrawal Submitted Successfully</CardTitle>
               <CardDescription>
-                Your Stellar transaction has been signed and broadcast to the network.
+                Your Stellar transaction has been signed and submitted to the network.
               </CardDescription>
             </div>
           </div>
@@ -153,7 +154,7 @@ function WithdrawFlowInner({
         <Alert>
           <Wallet className="h-4 w-4" />
           <AlertDescription className="flex items-center justify-between">
-            <span>Connect your Stellar wallet to sign live transactions, or preview below.</span>
+            <span>Connect your Stellar wallet to sign and submit withdrawal transactions.</span>
             <Button size="sm" variant="outline" onClick={connectWallet} disabled={connecting}>
               {connecting ? 'Connecting...' : 'Connect Wallet'}
             </Button>
@@ -202,9 +203,8 @@ function WithdrawFlowInner({
                   </div>
                   <Input
                     id="withdraw-amount"
-                    type="number"
-                    step="0.0000001"
-                    min="0"
+                    type="text"
+                    inputMode="decimal"
                     placeholder={`0.00 ${formData.asset}`}
                     value={formData.amount}
                     onChange={(e) => setFormData((prev) => ({ ...prev, amount: e.target.value }))}
@@ -336,9 +336,7 @@ function WithdrawFlowInner({
                   <div className="flex justify-between">
                     <span className="text-muted-foreground">Source Wallet</span>
                     <span className="font-mono">
-                      {publicKey
-                        ? formatShortStellarAddress(publicKey)
-                        : 'Connected Session Wallet'}
+                      {publicKey ? formatShortStellarAddress(publicKey) : 'Wallet Not Connected'}
                     </span>
                   </div>
                   <div className="flex justify-between">
@@ -429,7 +427,8 @@ export function WithdrawFlow({
   requireTwoFactor = false,
   onWithdrawSuccess,
 }: WithdrawFlowProps) {
-  const { publicKey } = useWalletStore();
+  const { isConnected, publicKey, signTransaction } = useWalletStore();
+  const [flowKey, setFlowKey] = useState(0);
   const [balances, setBalances] = useState<Record<WithdrawAssetCode, number>>(initialBalances);
   const [formData, setFormData] = useState<WithdrawFormData>({
     asset: 'XLM',
@@ -524,32 +523,77 @@ export function WithdrawFlow({
   );
 
   const handleOpenConfirmDialog = useCallback(() => {
-    const twoFaCheck = validateTwoFactorCode(formData.twoFactorCode, requireTwoFactor);
-    if (!twoFaCheck.isValid) {
-      toast.error(twoFaCheck.error);
-      return;
-    }
-    if (!formData.confirmedTerms) {
-      toast.error('Please confirm the transaction accuracy checkbox before proceeding');
-      return;
+    for (const step of steps) {
+      if (step.validate && !step.validate(formData)) {
+        return;
+      }
     }
     setSubmissionError(null);
     setIsConfirmModalOpen(true);
-  }, [formData.twoFactorCode, formData.confirmedTerms, requireTwoFactor]);
+  }, [steps, formData]);
 
   const handleExecuteWithdrawal = async () => {
+    for (const step of steps) {
+      if (step.validate && !step.validate(formData)) {
+        return;
+      }
+    }
+
+    if (!isConnected || !publicKey) {
+      const msg = 'Please connect your Stellar wallet before signing and submitting a withdrawal.';
+      setSubmissionError(msg);
+      toast.error(msg);
+      return;
+    }
+
     setIsSubmitting(true);
     setSubmissionError(null);
 
     try {
+      const memoText = formData.memoType === 'none' ? undefined : formData.memo.trim();
+      const { transaction, network_passphrase } = await createPaymentTransaction({
+        source: publicKey,
+        destination: formData.destination.trim(),
+        amount: formData.amount.trim(),
+        memo: memoText,
+      });
+
+      const passphraseString =
+        typeof network_passphrase === 'string' ? network_passphrase : networkPassphrase;
+
+      const signedTxXdr = await signTransaction(transaction, {
+        networkPassphrase: passphraseString,
+      });
+
+      const response = await fetch('/api/wallet/submit-transaction', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          signedXdr: signedTxXdr,
+        }),
+      });
+
+      const contentType = response.headers.get('content-type');
+      if (!contentType || !contentType.includes('application/json')) {
+        throw new Error(`API error: Received ${response.status} ${response.statusText}`);
+      }
+
+      const result = await response.json();
+      if (!response.ok || !result.hash) {
+        const errorMessage = result.error || result.message || 'Transaction submission failed';
+        throw new Error(errorMessage);
+      }
+
       const txResult: WithdrawTransactionResult = {
-        id: `wd_${Date.now()}`,
-        hash: `${Array.from({ length: 64 }, (_, i) => ((i * 7 + Date.now()) % 16).toString(16)).join('')}`,
+        id: `wd_${result.hash.slice(0, 12)}`,
+        hash: result.hash,
         asset: formData.asset,
-        amount: formData.amount,
+        amount: formData.amount.trim(),
         destination: formData.destination.trim(),
         feeXlm: feeEstimate.networkFeeXlm.toFixed(7),
-        memo: formData.memoType === 'none' ? undefined : formData.memo.trim(),
+        memo: memoText,
         status: 'completed',
         createdAt: new Date().toISOString(),
       };
@@ -564,11 +608,11 @@ export function WithdrawFlow({
 
       setIsConfirmModalOpen(false);
       setLastTransaction(txResult);
-      toast.success(`Successfully withdrew ${formData.amount} ${formData.asset}`);
+      toast.success(`Successfully withdrew ${formData.amount.trim()} ${formData.asset}`);
       onWithdrawSuccess?.(txResult);
     } catch (error: unknown) {
       const message =
-        error instanceof Error ? error.message : 'Failed to broadcast Stellar withdrawal';
+        error instanceof Error ? error.message : 'Failed to submit Stellar withdrawal';
       setSubmissionError(message);
       toast.error(message);
     } finally {
@@ -578,6 +622,7 @@ export function WithdrawFlow({
 
   const handleResetFlow = () => {
     setLastTransaction(null);
+    setFlowKey((k) => k + 1);
     setFormData((prev) => ({
       ...prev,
       amount: '',
@@ -591,7 +636,7 @@ export function WithdrawFlow({
 
   return (
     <div className={className}>
-      <StepperProvider steps={steps} formData={formData}>
+      <StepperProvider key={flowKey} steps={steps} formData={formData}>
         <WithdrawFlowInner
           formData={formData}
           setFormData={setFormData}
@@ -608,8 +653,8 @@ export function WithdrawFlow({
           <DialogHeader>
             <DialogTitle>Confirm Stellar Withdrawal</DialogTitle>
             <DialogDescription>
-              Please verify the final transaction parameters before broadcasting to the Stellar
-              network.
+              Please verify the final transaction parameters before signing with your Stellar
+              wallet.
             </DialogDescription>
           </DialogHeader>
 
@@ -652,7 +697,7 @@ export function WithdrawFlow({
               Cancel
             </Button>
             <Button onClick={handleExecuteWithdrawal} disabled={isSubmitting}>
-              {isSubmitting ? 'Broadcasting...' : 'Authorize & Broadcast'}
+              {isSubmitting ? 'Signing & Submitting...' : 'Sign & Submit Withdrawal'}
             </Button>
           </DialogFooter>
         </DialogContent>

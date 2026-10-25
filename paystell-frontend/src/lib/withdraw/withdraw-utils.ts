@@ -28,6 +28,10 @@ export function validateWithdrawAmount(
     return { isValid: false, error: 'Withdrawal amount is required' };
   }
 
+  if (!/^(\d+\.?\d*|\.\d+)$/.test(trimmed)) {
+    return { isValid: false, error: 'Please enter a valid positive withdrawal amount' };
+  }
+
   const parsed = Number(trimmed);
   if (!Number.isFinite(parsed) || parsed <= 0) {
     return { isValid: false, error: 'Please enter a valid positive withdrawal amount' };
